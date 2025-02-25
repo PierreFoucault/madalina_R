@@ -1,0 +1,181 @@
+#qiime2 LEG madalina project
+
+mamba activate qiime2-amplicon-2024.5
+
+#set working directory path
+
+#data directory
+mkdir 1_raw_data
+
+#create a manifest file
+
+#get filepaths
+for i in $PROJ/1_raw_data/*R1*fastq.gz ;  do echo $i; done > $PROJ/tmp
+
+n_delim="$(grep -o "[-|_|/]" <<<"$PROJ/1_raw_data/*fastq.gz" | wc -l)"
+echo $n_delim
+
+#here n_delim = 11
+
+echo $'sample-id\tforward-absolute-filepath\treverse-absolute-filepath'> $PROJ/manifest.tsv
+awk '{split($0,a,"-|_|/");print a[12]"-"a[13]"-"a[14]"-"a[15]"\t"$0"\t"$0}' $PROJ/tmp >> $PROJ/manifest.tsv
+awk '{sub("R1","R2",$3); print}' $PROJ/manifest.tsv > $PROJ/manifest.tsv
+
+#create metadata file
+
+echo $'sample-id\tprimer\tweek\tlocation\ttype' > $PROJ/metadata.txt
+awk '{split($0,a,"-|_|/") ; print a[12]"-"a[13]"-"a[14]"-"a[15]"\t"a[12]"\t"a[13]"\t"a[14]"\t"a[15]}' $PROJ/tmp >> $PROJ/metadata.txt
+
+#Import raw reads and preprocessing
+
+#new dir
+mkdir $PROJ/2_trim
+
+qiime tools import --type 'SampleData[PairedEndSequencesWithQuality]' --input-path $PROJ/manifest.tsv  --input-format  PairedEndFastqManifestPhred33V2 --output-path $PROJ/2_trim/demux-paired-end.qza
+
+#remove primer
+qiime cutadapt trim-paired --i-demultiplexed-sequences $PROJ/2_trim/demux-paired-end.qza --p-front-f GGCCTACCAAGGCGACGATCG --p-front-r CACCGGAAATTCCACTACCCTCTC --o-trimmed-sequences $PROJ/2_trim/demux_trim.qza
+
+#visualier sequencing quality
+qiime demux summarize --i-data $PROJ/2_trim/demux_trim.qza --o-visualization $PROJ/2_trim/demux_trim.qzv
+
+#set at F245 and R170
+
+#Denoising and dada2 pipeline
+
+#new dir
+mkdir $PROJ/3_denoise
+
+qiime dada2 denoise-paired --p-n-threads 10 --i-demultiplexed-seqs $PROJ/2_trim/demux_trim.qza --p-trunc-len-f $truncF --p-trunc-len-r $truncR --output-dir $PROJ/3_denoise/${truncF}_${truncR}
+
+#check results
+qiime metadata tabulate --m-input-file $PROJ/3_denoise/245_170/denoising_stats.qza --o-visualization $PROJ/3_denoise/245_170/denoising_stats.qzv
+
+#Assign and filter
+
+#remove singleton
+qiime feature-table filter-features --i-table $PROJ/3_denoise/245_170/table.qza --p-min-frequency 2 --o-filtered-table $PROJ/3_denoise/245_170/no_singleton_table.qza
+
+qiime feature-table filter-seqs --i-data $PROJ/3_denoise/245_170/representative_sequences.qza --i-table $PROJ/3_denoise/245_170/no_singleton_table.qza --o-filtered-data $PROJ/3_denoise/245_170/no_singleton_rep_seq.qza
+
+#new dir
+mkdir $PROJ/4_assign
+
+# MAKING GTDB DATABASE
+
+# Get latest GTDB database taxonomy and SSU rep seq files (here release 220.0)
+
+wget -P $PROJ/4_assign https://data.gtdb.ecogenomic.org/releases/latest/bac120_taxonomy.tsv.gz
+wget -P $PROJ/4_assign https://data.gtdb.ecogenomic.org/releases/latest/genomic_files_reps/bac120_ssu_reps.fna.gz
+
+gunzip $PROJ/4_assign/bac120_taxonomy.tsv.gz
+gunzip $PROJ/4_assign/bac120_ssu_reps.fna.gz
+
+#import to qiime2
+
+qiime tools import --input-path $PROJ/4_assign/bac120_taxonomy.tsv --type 'FeatureData[Taxonomy]' --input-format 'HeaderlessTSVTaxonomyFormat' --output-path $PROJ/4_assign/GTDB_bac120_taxonomy.qza
+
+qiime tools import --input-path $PROJ/4_assign/bac120_ssu_reps.fna --type 'FeatureData[Sequence]' --output-path $PROJ/4_assign/GTDB_bac120_rep_seq.qza
+
+#trim to our LEG primers (forward GGCCTACCAAGGCGACGATCG / reverse CACCGGAAATTCCACTACCCTCTC / min. 200pb max. 600pb sequence length)
+
+qiime feature-classifier extract-reads --i-sequences $PROJ/4_assign/GTDB_bac120_rep_seq.qza --p-f-primer GGCCTACCAAGGCGACGATCG --p-r-primer CACCGGAAATTCCACTACCCTCTC --p-min-length 200 --p-max-length 600 --o-reads $PROJ/4_assign/GTDB_LEG_rep_seq.qza
+
+qiime feature-classifier fit-classifier-naive-bayes --i-reference-reads $PROJ/4_assign/GTDB_LEG_rep_seq.qza --i-reference-taxonomy $PROJ/4_assign/GTDB_bac120_taxonomy.qza --o-classifier $PROJ/4_assign/GTDB_LEG_classifier.qza
+
+
+# MAKING LPSN DATABASE
+
+#download LPSN leginella species fasta
+Rscript $PROJ/Download_16S_from_lpsn.R legionella $PROJ/4_assign/LPSN
+
+#merge to a single fasta file
+cat $PROJ/4_assign/LPSN/*  | sed '/^[[:space:]]*$/d' | sed 's/__.*/ /' > $PROJ/4_assign/LPSN_legionella_seqs.fasta
+
+#remove if duplicate
+Rscript  $PROJ/4_assign/Remove_repeated_headers_and_seqs.R $PROJ/4_assign/LPSN_legionella_seqs.fasta $PROJ/4_assign/LPSN_legionella_unique_seqs.fasta
+
+#create taxonomy
+
+grep -e ">" $PROJ/4_assign/LPSN_legionella_unique_seqs.fasta > $PROJ/4_assign/tmp_tax
+awk '{sub(/^>/, ""); print $0"\td__Bacteria; p__Proteobacteria; c__Gammaproteobacteria; o__Legionellales; f__Legionellaceae; g__Legionella; s__"$0}' $PROJ/4_assign/tmp_tax > $PROJ/4_assign/LPSN_legionella_taxonomy.tsv
+
+#import to qiime2
+
+qiime tools import --input-path $PROJ/4_assign/LPSN_legionella_taxonomy.tsv --type 'FeatureData[Taxonomy]' --input-format 'HeaderlessTSVTaxonomyFormat' --output-path $PROJ/4_assign/LPSN_legionella_taxonomy.qza
+
+qiime tools import --input-path $PROJ/4_assign/LPSN_legionella_unique_seqs.fasta --type 'FeatureData[Sequence]' --output-path $PROJ/4_assign/LPSN_legionella_rep_seq.qza
+
+#trim to our LEG primers (forward GGCCTACCAAGGCGACGATCG / reverse CACCGGAAATTCCACTACCCTCTC / min. 200pb max. 600pb sequence length)
+
+qiime feature-classifier extract-reads --i-sequences $PROJ/4_assign/LPSN_legionella_rep_seq.qza  --p-f-primer GGCCTACCAAGGCGACGATCG --p-r-primer CACCGGAAATTCCACTACCCTCTC --p-min-length 200 --p-max-length 600 --o-reads $PROJ/4_assign/LPSN_lEG_rep_seq.qza
+
+qiime feature-classifier fit-classifier-naive-bayes --i-reference-reads $PROJ/4_assign/LPSN_legionella_rep_seq.qza --i-reference-taxonomy $PROJ/4_assign/LPSN_legionella_taxonomy.qza --o-classifier $PROJ/4_assign/LPSN_lEG_classifier.qza
+
+qiime feature-classifier classify-sklearn --i-classifier $PROJ/4_assign/GTDB_LEG_classifier.qza --i-reads  $PROJ/3_denoise/245_170/no_singleton_rep_seq.qza --o-classification $PROJ/4_assign/GTDB_taxonomy.qza
+
+qiime feature-table summarize --i-table $PROJ/3_denoise/245_170/no_singleton_table.qza --o-visualization $PROJ/3_denoise/245_170/no_singleton_table.qzv
+#22498 ASVs
+
+qiime taxa filter-table --i-table $PROJ/3_denoise/245_170/no_singleton_table.qza  --i-taxonomy $PROJ/4_assign/GTDB_taxonomy.qza --p-exclude unassigned,eukaryota,mitochondria,chloroplast --o-filtered-table $PROJ/4_assign/filtered_GTDB_table.qza
+#22498 ASVs
+
+qiime feature-table summarize --i-table $PROJ/4_assign/filtered_GTDB_table.qza --o-visualization $PROJ/4_assign/filtered_GTDB_table.qzv
+#22498 ASVs same
+
+#rarefy at lowest sampling depth (22498 reads, removing one sample: Legio-S9-souT-S77 118 reads)
+qiime feature-table rarefy --i-table $PROJ/4_assign/filtered_GTDB_table.qza --p-sampling-depth 22498 --o-rarefied-table $PROJ/4_assign/rar_filtered_GTDB_table.qza
+
+qiime feature-table summarize --i-table $PROJ/4_assign/rar_filtered_GTDB_table.qza --o-visualization $PROJ/4_assign/rar_filtered_GTDB_table.qzv
+
+#update representative sequences file
+qiime feature-table filter-seqs --i-data $PROJ/3_denoise/245_170/no_singleton_rep_seq.qza --i-table $PROJ/4_assign/rar_filtered_GTDB_table.qza --o-filtered-data $PROJ/4_assign/rar_filtered_GTDB_rep_seq.qza
+
+#new taxonomy table
+qiime feature-classifier classify-sklearn --i-classifier $PROJ/4_assign/GTDB_LEG_classifier.qza --i-reads $PROJ/4_assign/rar_filtered_GTDB_rep_seq.qza --o-classification $PROJ/4_assign/rar_filtered_GTDB_taxonomy.qza --p-n-jobs 5
+
+# Check GTDB legionella specificity
+qiime taxa barplot --i-table $PROJ/4_assign/rar_filtered_GTDB_table.qza --i-taxonomy $PROJ/4_assign/rar_filtered_GTDB_taxonomy.qza --m-metadata-file $PROJ/metadata.txt --o-visualization $PROJ/sample_barplot.qzv
+
+#Phylogenetic tree
+
+#new dir
+mkdir $PROJ/5_tree
+
+qiime phylogeny align-to-tree-mafft-fasttree --i-sequences $PROJ/4_assign/rar_filtered_rep_seq.qza --output-dir $PROJ/5_tree --p-n-threads 15
+
+
+# MAKING GTDB DATABASE
+
+# Get latest GTDB database taxonomy and SSU rep seq files (here release 220.0)
+
+wget -P $PROJ/4_assign https://data.gtdb.ecogenomic.org/releases/latest/bac120_taxonomy.tsv.gz
+wget -P $PROJ/4_assign https://data.gtdb.ecogenomic.org/releases/latest/genomic_files_reps/bac120_ssu_reps.fna.gz
+
+gunzip $PROJ/4_assign/bac120_taxonomy.tsv.gz
+gunzip $PROJ/4_assign/bac120_ssu_reps.fna.gz
+
+#import to qiime2
+
+qiime tools import --input-path $PROJ/4_assign/bac120_taxonomy.tsv --type 'FeatureData[Taxonomy]' --input-format 'HeaderlessTSVTaxonomyFormat' --output-path $PROJ/4_assign/GTDB_bac120_taxonomy.qza
+
+qiime tools import --input-path $PROJ/4_assign/bac120_ssu_reps.fna --type 'FeatureData[Sequence]' --output-path $PROJ/4_assign/GTDB_bac120_rep_seq.qza
+
+#trim to our LEG primers (forward GGCCTACCAAGGCGACGATCG / reverse CACCGGAAATTCCACTACCCTCTC / min. 200pb max. 600pb sequence length)
+
+qiime feature-classifier extract-reads --i-sequences $PROJ/4_assign/GTDB_bac120_rep_seq.qza --p-f-primer GGCCTACCAAGGCGACGATCG --p-r-primer CACCGGAAATTCCACTACCCTCTC --p-min-length 200 --p-max-length 600 --o-reads $PROJ/4_assign/GTDB_LEG_rep_seq.qza
+
+qiime feature-classifier fit-classifier-naive-bayes --i-reference-reads $PROJ/4_assign/GTDB_LEG_rep_seq.qza --i-reference-taxonomy $PROJ/4_assign/GTDB_bac120_taxonomy.qza --o-classifier $PROJ/4_assign/GTDB_LEG_classifier.qza
+
+
+
+#train the classifier on SILVA 138
+
+#qiime feature-classifier fit-classifier-naive-bayes --i-reference-reads $PROJ/4_assign/silva-138-99-seqs-515-806.qza --i-reference-taxonomy $PROJ/#4_assign/silva-138-99-tax-515-806.qza --o-classifier classifier_16S_V4_515F806R.qza
+
+#assign taxonomy
+#qiime feature-classifier classify-sklearn --i-classifier $PROJ/4_assign/classifier_16S_V4_515F806R.qza --i-reads  $PROJ/3_denoise/275_190/#no_singleton_rep_seq.qza --o-classification $PROJ/4_assign/taxonomy.qza
+
+#taxonomy filter
+#qiime taxa filter-table --i-table $PROJ/3_denoise/${truncF}_${truncR}/no_singleton_table.qza  --i-taxonomy $PROJ/4_assign/taxonomy.qza --p-exclude #unassigned,eukaryota,mitochondria,chloroplast --o-filtered-table $PROJ/4_assign/filtered_table.qza
+
